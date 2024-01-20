@@ -3,6 +3,28 @@ name = "jacoin"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# see more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+clap = { version = "4.4.16", features = ["derive"] }
+futures = "0.3.30"
+futures-timer = "3.0"
+libp2p = { version = "0.53.2", features = [
+  "dns",
+  "dcutr",
+  "identify",
+  "macros",
+  "noise",
+  "ping",
+  "quic",
+  "relay",
+  "rendezvous",
+  "tcp",
+  "tokio",
+  "yamux",
+  "gossipsub",
+] }
+log = "0.4"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
