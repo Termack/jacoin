@@ -2,7 +2,7 @@ use clap::Parser;
 use futures::{executor::block_on, future::FutureExt, stream::StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, gossipsub, identify, identity, noise, ping, relay,
+    dcutr, gossipsub, identify, identity, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId,
 };
@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 struct Opts {
     /// The mode (client-listen, client-dial).
     #[clap(long)]
-    mode: Mode,
+    mode: Option<Mode>,
 
     /// Fixed value to generate deterministic peer id.
     #[clap(long)]
@@ -36,7 +36,7 @@ struct Opts {
 #[derive(Clone, Debug, PartialEq, Parser)]
 enum Mode {
     Dial,
-    Listen,
+    None,
 }
 
 impl FromStr for Mode {
@@ -44,8 +44,7 @@ impl FromStr for Mode {
     fn from_str(mode: &str) -> Result<Self, Self::Err> {
         match mode {
             "dial" => Ok(Mode::Dial),
-            "listen" => Ok(Mode::Listen),
-            _ => Err("Expected either 'dial' or 'listen'".to_string()),
+            _ => Ok(Mode::None),
         }
     }
 }
@@ -61,6 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     #[derive(NetworkBehaviour)]
     struct Behaviour {
         relay_client: relay::client::Behaviour,
+        mdns: mdns::tokio::Behaviour,
         ping: ping::Behaviour,
         identify: identify::Behaviour,
         dcutr: dcutr::Behaviour,
@@ -105,6 +105,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "/TODO/0.0.1".to_string(),
                         keypair.public(),
                     )),
+                    mdns: mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        keypair.public().to_peer_id(),
+                    )?,
                     dcutr: dcutr::Behaviour::new(keypair.public().to_peer_id()),
                     gossipsub,
                 })
@@ -129,7 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             tracing::info!(%address, "Listening on address");
                         }
-                        event => panic!("{event:?}"),
+                        event => println!("{event:?}"),
                     }
                 }
                 _ = delay => {
@@ -175,19 +179,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    match opts.mode {
-        Mode::Dial => {
+    swarm
+        .listen_on(opts.relay_address.clone().with(Protocol::P2pCircuit))
+        .unwrap();
+
+    if let Some(mode) = opts.mode {
+        if let Mode::Dial = mode {
             swarm
                 .dial(
                     opts.relay_address
                         .with(Protocol::P2pCircuit)
                         .with(Protocol::P2p(opts.remote_peer_id.unwrap())),
                 )
-                .unwrap();
-        }
-        Mode::Listen => {
-            swarm
-                .listen_on(opts.relay_address.with(Protocol::P2pCircuit))
                 .unwrap();
         }
     }
@@ -208,13 +211,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    for (peer_id, _multiaddr) in list {
+                        println!("mDNS discovered a new peer: {peer_id}");
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
+                },
+                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                    for (peer_id, _multiaddr) in list {
+                        println!("mDNS discover peer has expired: {peer_id}");
+                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                    }
+                },
                 SwarmEvent::NewListenAddr { address, .. } => {
                     tracing::info!(%address, "Listening on address");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { .. },
                 )) => {
-                    assert!(opts.mode == Mode::Listen);
                     tracing::info!("Relay accepted our reservation request");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
@@ -243,7 +257,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "Message: '{}' with id: {id} from peer: {peer_id}",
                         String::from_utf8_lossy(&message.data),
                     ),
-                event => println!("{:?}", event),
+                event => println!("Event: {:?}", event),
             }
         }
     }
