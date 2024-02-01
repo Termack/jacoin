@@ -2,11 +2,11 @@ use clap::Parser;
 use futures::{executor::block_on, future::FutureExt, stream::StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, gossipsub, identify, identity, mdns, noise, ping, relay,
+    dcutr, gossipsub, identify, identity, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, PeerId,
+    tcp, yamux, PeerId, Swarm,
 };
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::{error::Error, time::Duration};
@@ -49,6 +49,15 @@ impl FromStr for Mode {
     }
 }
 
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    relay_client: relay::client::Behaviour,
+    ping: ping::Behaviour,
+    identify: identify::Behaviour,
+    dcutr: dcutr::Behaviour,
+    gossipsub: gossipsub::Behaviour,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
@@ -56,16 +65,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .try_init();
 
     let opts = Opts::parse();
-
-    #[derive(NetworkBehaviour)]
-    struct Behaviour {
-        relay_client: relay::client::Behaviour,
-        mdns: mdns::tokio::Behaviour,
-        ping: ping::Behaviour,
-        identify: identify::Behaviour,
-        dcutr: dcutr::Behaviour,
-        gossipsub: gossipsub::Behaviour,
-    }
 
     let mut swarm =
         libp2p::SwarmBuilder::with_existing_identity(generate_ed25519(opts.secret_key_seed))
@@ -105,10 +104,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "/TODO/0.0.1".to_string(),
                         keypair.public(),
                     )),
-                    mdns: mdns::tokio::Behaviour::new(
-                        mdns::Config::default(),
-                        keypair.public().to_peer_id(),
-                    )?,
                     dcutr: dcutr::Behaviour::new(keypair.public().to_peer_id()),
                     gossipsub,
                 })
@@ -147,13 +142,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Connect to the relay server. Not for the reservation or relayed connection, but to (a) learn
     // our local public address and (b) enable a freshly started relay to learn its public address.
     swarm.dial(opts.relay_address.clone()).unwrap();
+
     block_on(async {
         let mut learned_observed_addr = false;
         let mut told_relay_observed_addr = false;
 
         loop {
             match swarm.next().await.unwrap() {
-                SwarmEvent::NewListenAddr { .. } => {}
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Someone is listening on address {address:?}")
+                }
                 SwarmEvent::Dialing { .. } => {}
                 SwarmEvent::ConnectionEstablished { .. } => {}
                 SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
@@ -188,6 +186,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             swarm
                 .dial(
                     opts.relay_address
+                        .clone()
                         .with(Protocol::P2pCircuit)
                         .with(Protocol::P2p(opts.remote_peer_id.unwrap())),
                 )
@@ -200,31 +199,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
+    let mut sent = false;
+
+    let mut connected_nodes = HashSet::new();
 
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
+
+                if !sent {
+                    let listener = opts
+                        .relay_address
+                        .clone()
+                        .with(Protocol::P2pCircuit)
+                        .with(Protocol::P2p(swarm.local_peer_id().to_owned()));
+
+                    if let Err(err) = swarm.behaviour_mut().gossipsub.publish(
+                        topic.clone(),
+                        [&[1u8], listener.to_string().as_bytes()].concat(),
+                    ) {
+                        println!("Error publishing address: {err}");
+                    } else {
+                        sent = true;
+                    }
+                }
+
                 if let Err(e) = swarm
                     .behaviour_mut().gossipsub
-                    .publish(topic.clone(), line.as_bytes()) {
+                    .publish(topic.clone(), [&[2u8], line.as_bytes()].concat()) {
                     println!("Publish error: {e:?}");
                 }
             }
             event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, _multiaddr) in list {
-                        println!("mDNS discovered a new peer: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    if swarm.is_connected(&peer_id) {
+                        connected_nodes.remove(&peer_id);
                     }
-                },
-                SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer_id, _multiaddr) in list {
-                        println!("mDNS discover peer has expired: {peer_id}");
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    }
-                },
+                }
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    tracing::info!(%address, "Listening on address");
+                    println!("Someone is listening on address {address:?}")
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
                     relay::client::Event::ReservationReqAccepted { .. },
@@ -245,6 +258,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     peer_id, endpoint, ..
                 } => {
                     tracing::info!(peer=%peer_id, ?endpoint, "Established new connection");
+                    connected_nodes.insert(peer_id);
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     tracing::info!(peer=?peer_id, "Outgoing connection failed: {error}");
@@ -253,13 +267,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     propagation_source: peer_id,
                     message_id: id,
                     message,
-                })) => println!(
-                        "Message: '{}' with id: {id} from peer: {peer_id}",
-                        String::from_utf8_lossy(&message.data),
-                    ),
+                })) => {
+                    match message.data[0] {
+                        1 => dial_if_not_connected(&message.data[1..], &mut connected_nodes, &mut swarm),
+                        2 => println!("Message: '{}' with id: {id} from peer: {peer_id}",String::from_utf8_lossy(&message.data[1..])),
+                        _ => println!("Broken message"),
+                    }
+                },
                 event => println!("Event: {:?}", event),
             }
         }
+    }
+}
+
+fn dial_if_not_connected(
+    message: &[u8],
+    nodes: &mut HashSet<PeerId>,
+    swarm: &mut Swarm<Behaviour>,
+) {
+    let mut address: Multiaddr = String::from_utf8_lossy(message).parse().unwrap();
+    let p2p = address.pop().unwrap();
+
+    let peer_id = match p2p {
+        Protocol::P2p(peer_id) => peer_id,
+        _ => return,
+    };
+
+    if nodes.contains(&peer_id) {
+        return;
+    }
+
+    address.push(p2p);
+
+    println!("Address: '{}'", address);
+    match swarm.dial(address.clone()) {
+        Ok(()) => {
+            nodes.insert(peer_id);
+        }
+        Err(err) => println!("Error connecting to address {address}: {err}"),
     }
 }
 
