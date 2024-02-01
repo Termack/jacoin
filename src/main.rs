@@ -6,7 +6,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId, Swarm,
 };
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::{error::Error, time::Duration};
@@ -201,7 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     let mut sent = false;
 
-    let mut connected_nodes = HashSet::new();
+    let mut connected_nodes = HashMap::new();
 
     loop {
         select! {
@@ -232,7 +232,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    if swarm.is_connected(&peer_id) {
+                    if !swarm.is_connected(&peer_id) {
                         connected_nodes.remove(&peer_id);
                     }
                 }
@@ -258,7 +258,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     peer_id, endpoint, ..
                 } => {
                     tracing::info!(peer=%peer_id, ?endpoint, "Established new connection");
-                    connected_nodes.insert(peer_id);
+                    connected_nodes.insert(peer_id, peer_id.to_string());
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     tracing::info!(peer=?peer_id, "Outgoing connection failed: {error}");
@@ -270,7 +270,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })) => {
                     match message.data[0] {
                         1 => dial_if_not_connected(&message.data[1..], &mut connected_nodes, &mut swarm),
-                        2 => println!("Message: '{}' with id: {id} from peer: {peer_id}",String::from_utf8_lossy(&message.data[1..])),
+                        2 => {
+                            let message = String::from_utf8_lossy(&message.data[1..]);
+                            if message.starts_with("/username ") {
+                                let username = message.strip_prefix("/username ").unwrap();
+                                *connected_nodes.get_mut(&peer_id).unwrap() = username.to_string();
+                            }
+                            println!("Message from {}: '{}'",connected_nodes[&peer_id], message);
+
+                        },
                         _ => println!("Broken message"),
                     }
                 },
@@ -282,7 +290,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn dial_if_not_connected(
     message: &[u8],
-    nodes: &mut HashSet<PeerId>,
+    nodes: &mut HashMap<PeerId, String>,
     swarm: &mut Swarm<Behaviour>,
 ) {
     let mut address: Multiaddr = String::from_utf8_lossy(message).parse().unwrap();
@@ -293,7 +301,7 @@ fn dial_if_not_connected(
         _ => return,
     };
 
-    if nodes.contains(&peer_id) {
+    if nodes.contains_key(&peer_id) {
         return;
     }
 
@@ -302,7 +310,7 @@ fn dial_if_not_connected(
     println!("Address: '{}'", address);
     match swarm.dial(address.clone()) {
         Ok(()) => {
-            nodes.insert(peer_id);
+            nodes.insert(peer_id, peer_id.to_string());
         }
         Err(err) => println!("Error connecting to address {address}: {err}"),
     }
